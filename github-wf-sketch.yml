@@ -1,0 +1,91 @@
+name: Build and Deploy .NET Core and React App to Azure
+
+on:
+  push:
+    branches:
+      - main
+
+env:
+  ...
+
+jobs:
+  setup_infrastructure:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout repo
+      uses: actions/checkout@v2
+
+    - name: CLI login for SP
+      run: |
+        az login --service-principal ${{ secrets.AZURE_SP_CREDS }} --output none
+
+    - name: Ensure Bicep is installed and up-to-date
+      run: |
+        az bicep install
+        az bicep upgrade
+
+    - name: Deploy any unrelated infrastructure with Bicep
+      run: |
+        az deployment group create -g ${{env.RESOURCE_GROUP}} -f ${{PATH_TO_BICEP_FILE}} --parameters ${{PATH_TO_PARAMS_FILE}}
+
+
+  build_and_deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v2
+      
+    - name: Setup .NET Core
+      uses: actions/setup-dotnet@v1
+      with:
+        dotnet-version: '7.0.x'
+
+    - name: Restore .NET dependencies
+      run: dotnet restore
+
+    - name: Build the .NET app
+      run: dotnet build --configuration Release
+
+    - name: Run tests
+      run: dotnet test --no-restore --verbosity normal
+
+    - name: Publish the .NET app
+      run: dotnet publish -c Release -o ./publish
+
+    - name: Deploy .NET app to Azure
+      run: |
+        az appservice plan create --name ${{env.ASP_NAME}} --resource-group ${{env.RESOURCE_GROUP}} --sku FREE --location ${{env.LOCATION}}
+        az webapp create --name ${{env.WA_NAME}} --resource-group ${{env.RESOURCE_GROUP}} --plan ${{env.ASP_NAME}} --runtime ${{env.DONTNET_VERSION}}
+        az webapp up --name ${{env.WA_NAME}} myWebApp --resource-group ${{env.RESOURCE_GROUP}} --location ${{env.LOCATION}} --html
+
+    # Build and deploy React App as static site
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v2
+      with:
+        node-version: '14.x'
+
+    - name: Install dependencies
+      if: steps.cache-node-modules.outputs.cache-hit != 'true'
+      run: yarn install
+
+    - name: Build React App
+      env:
+        REACT_APP_ENV: 'azure'
+        CI: ''
+      run: yarn build
+
+    - name: Run tests
+      run: yarn test --ci
+      
+    - name: Create storage account and enable web container for static site
+      run: |
+        az storage account create --name ${{env.AZURE_STORAGE_NAME}} --resource-group ${{env.AZURE_RESOURCE_GROUP}} --location ${{env.AZURE_REGION}} --sku Standard_LRS
+        az storage container create --name '$web' --account-name ${{env.AZURE_STORAGE_NAME}} --public-access blob
+        az storage blob service-properties update --static-website --404-document "index.html" --index-document "index.html" --account-name ${{env.AZURE_STORAGE_NAME}}
+
+    - name: Deploy Static Site to Azure
+      continue-on-error: false
+      run: az storage blob upload-batch -d '$web' -s ./build --account-name ${{env.AZURE_STORAGE_NAME}}
